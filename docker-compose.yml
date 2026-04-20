@@ -1,0 +1,13 @@
+services:
+  pipeline:
+    build: .
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATA_PATH=/app/docs/sample-data
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=local
+    volumes:
+      - ./docs/sample-data:/app/docs/sample-data:ro
+      - ./scripts:/app/scripts
+      - ./tests:/app/tests
+    command: tail -f /dev/null
