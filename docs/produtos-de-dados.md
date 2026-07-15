@@ -7,7 +7,9 @@
 
 ## Operações
 
-**Artefatos:** `gold_ops_reconciliation_daily` (VIEW), `gold_ops_reconciliation_trend` (VIEW)
+**Artefatos:**
+ - `gold_ops_reconciliation_daily` (VIEW), 
+ - `gold_ops_reconciliation_trend` (VIEW)
 
 ### Perguntas que o modelo responde
 
@@ -19,18 +21,10 @@
 | Quantas transações ficaram sem contraparte no processador hoje? | `txn_count WHERE category = 'UNRECONCILED_PROCESSOR'` |
 | Em quantos dias dos últimos 7 a taxa de MISMATCHED ficou acima de X%? | filtro sobre `gold_ops_reconciliation_trend` |
 
-### Perguntas que o modelo deliberadamente **não** responde
-
-- **SLA de resolução por caso:** o modelo registra o resultado da reconciliação, não o ciclo de vida do incidente de cada transação (isso pertence a um sistema de ticketing).
-- **Dados em tempo real (sub-hora):** a granularidade é `reference_date` (dia de negócio). Reconciliação intra-dia exigiria uma janela temporal diferente no pipeline.
-- **Por que uma transação específica ficou MISMATCHED:** o modelo informa o *fato* da discrepância e o valor; a investigação causal é manual.
-- **Ranking de merchants por taxa de problema:** esses dados existem na camada Gold, mas estão na view do CFO (`gold_cfo_weekly_merchant_ranking`), não na de Ops — o consumidor e o ritmo de uso são diferentes.
 
 ### Por que essas e não outras
 
-Ops precisa de **sinal de saúde em tempo real** para agir hoje, não de relatórios retrospectivos. O design escolheu `VIEW` (não table materializada) justamente para garantir que o dado reflita sempre o estado mais recente da silver layer, sem delay de rebuild. A adição da média móvel de 7 dias (`pct_of_total_7d_avg`) no trend resolve o problema de "subindo ou é flutuação normal?" — sem isso, a taxa isolada é ruído.
-
-Deixamos de fora rankings por merchant e visão semanal porque esses dados têm cadência diferente (semanal, orientada a gestão) e um consumidor diferente (CFO), evitando um artefato genérico que serve mal a todos.
+Ops precisa de **sinal de saúde em tempo real** para agir hoje, não de relatórios retrospectivos. O design escolheu `VIEW` (não table materializada) justamente para garantir que o dado reflita sempre o estado mais recente da silver layer, sem delay de rebuild. A adição da média móvel de 7 dias (`pct_of_total_7d_avg`) no trend resolve o problema de "subindo ou é flutuação normal?"
 
 ---
 

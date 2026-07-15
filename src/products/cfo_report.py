@@ -2,14 +2,13 @@
 CFO weekly reconciliation report producer.
 
 Reads from gold_cfo_weekly_summary and gold_cfo_weekly_merchant_ranking and renders
-a simulated HTML email with:
+an HTML report with:
   - KPI headline (total BRL volume, transaction count, week-over-week change)
   - SVG bar chart of BRL volume by category
   - Summary table by category with week-over-week delta
   - Top-N merchant risk ranking (default N=10, overridable via CFO_REPORT_TOP_N)
 
-Writes to:  output/reports/{YYYYMMDD}_cfo_report.html
-Logs:       simulated email API call (recipient, subject, body path)
+Writes to:  {output_dir}/{YYYYMMDD}_cfo_report.html
 """
 import html
 import json
@@ -23,23 +22,23 @@ from src.db import get_connection
 
 logger = logging.getLogger(__name__)
 
-_OUTPUT_DIR = Path("output/reports")
-_CFO_EMAIL: str = os.environ.get("CFO_EMAIL", "cfo@company.example")
 _TOP_N: int = int(os.environ.get("CFO_REPORT_TOP_N", "10"))
 
 
 def run(
     week_start: str | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
+    output_dir: str | Path = "output/reports",
 ) -> dict:
     """
-    Renders the weekly CFO report as a simulated HTML email.
+    Renders the weekly CFO report as an HTML file.
 
     Args:
-        week_start: ISO week start (Monday, YYYY-MM-DD). Defaults to latest available week.
+        week_start:  ISO week start (Monday, YYYY-MM-DD). Defaults to latest available week.
+        output_dir:  Directory where the report file is written.
 
     Returns:
-        Dict with week_start, report_path, email_to, email_subject.
+        Dict with week_start and report_path.
     """
     owns_conn = conn is None
     _conn = conn if conn is not None else get_connection()
@@ -54,26 +53,19 @@ def run(
         prev_summary = _get_prev_summary(_conn, ws)
         ranking = _get_ranking(_conn, ws, _TOP_N)
 
-        _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
         chart_svg = _summary_chart(summary)
         content = _render_html(ws, summary, prev_summary, ranking, chart_svg)
 
         safe_ws = ws.replace("-", "")
-        report_path = _OUTPUT_DIR / f"{safe_ws}_cfo_report.html"
+        report_path = out_dir / f"{safe_ws}_cfo_report.html"
         report_path.write_text(content, encoding="utf-8")
 
-        subject = f"Weekly Reconciliation Report — Week of {ws}"
-        logger.info(
-            "[SIMULATED EMAIL] to=%s subject=%r report=%s",
-            _CFO_EMAIL,
-            subject,
-            report_path,
-        )
+        logger.info("CFO report written to %s", report_path)
         return {
             "week_start": ws,
             "report_path": str(report_path),
-            "email_to": _CFO_EMAIL,
-            "email_subject": subject,
         }
     finally:
         if owns_conn:
@@ -293,8 +285,7 @@ def _render_html(
 
   <div class="footer">
     Data source: <code>gold_cfo_weekly_summary</code>, <code>gold_cfo_weekly_merchant_ranking</code>
-    &bull; This is a simulated email — in production, delivered via transactional email API
-    to <em>{html.escape(_CFO_EMAIL)}</em>
+    &bull; Generated automatically
   </div>
 </body>
 </html>"""
@@ -308,5 +299,6 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
     ws = sys.argv[1] if len(sys.argv) > 1 else None
-    result = run(week_start=ws)
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else "output/reports"
+    result = run(week_start=ws, output_dir=out_dir)
     print(json.dumps(result, indent=2, default=str))

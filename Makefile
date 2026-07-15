@@ -23,7 +23,7 @@ shell: ## Open an interactive shell inside the container
 logs: ## Tail container logs
 	$(COMPOSE) logs -f
 
-test: ## Run the generator smoke tests inside the container
+test: ## Run the generator smoke tests inside the container	
 	$(PIPELINE) pytest tests/ -v
 
 generate: ## Generate a small synthetic dataset (10k rows) into /tmp/generated
@@ -47,7 +47,7 @@ build-gold: ## Build gold layer views and tables
 	$(PIPELINE) python -m src.gold.build
 
 run-alerts: ## Run ops alert for the latest reconciled date
-	$(PIPELINE) python -m src.outputs.ops_alert
+	$(PIPELINE) python -m src.outputs.ops_alert "" output/reports
 
 run-cfo-report: ## Render CFO weekly report for the latest week
 	$(PIPELINE) python -m src.outputs.cfo_report

@@ -4,4 +4,4 @@ WORKDIR /app
 
 COPY . .
 
-RUN pip install --no-cache-dir -e ".[dev]"
+RUN pip install --no-cache-dir --timeout 120 -e ".[dev]"

@@ -10,4 +10,5 @@ services:
       - ./docs/sample-data:/app/docs/sample-data:ro
       - ./scripts:/app/scripts
       - ./tests:/app/tests
+      - ./output:/app/output
     command: tail -f /dev/null

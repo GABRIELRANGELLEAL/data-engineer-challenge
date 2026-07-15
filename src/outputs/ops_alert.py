@@ -1,13 +1,13 @@
 """
 Ops alert producer.
 
-Evaluates reconciliation health for a reference_date and emits simulated Slack artifacts:
-  - output/alerts/{date}_chart.svg   — bar chart of category rates
-  - output/alerts/{date}_alert.json  — Slack Block Kit payload
+Evaluates reconciliation health for a reference_date and writes:
+  - {output_dir}/{date}_rates.svg   — bar chart of category rates for the day
+  - {output_dir}/{date}_trend.svg   — time-series line chart of rates over last 30 days
+  - {output_dir}/{date}_alert.txt   — plain text alert summary
 
 Trigger conditions (evaluated in order):
-  1. Latest run for the date has status != COMPLETED (checked in silver — a failed run
-     may have no gold rows at all, so we must check silver_reconciliation_runs directly).
+  1. Latest run for the date has status != COMPLETED.
   2. A category rate exceeds its configured threshold AND is above TREND_SPIKE_MULT × 7-day avg
      (or has no 7-day history yet, in which case the threshold alone triggers).
 
@@ -24,29 +24,29 @@ from src.db import get_connection
 
 logger = logging.getLogger(__name__)
 
-_OUTPUT_DIR = Path("output/alerts")
-
 MISMATCHED_THRESHOLD: float = float(os.environ.get("ALERT_MISMATCHED_THRESHOLD", "0.05"))
 UNRECONCILED_THRESHOLD: float = float(os.environ.get("ALERT_UNRECONCILED_THRESHOLD", "0.10"))
 TREND_SPIKE_MULT: float = float(os.environ.get("ALERT_TREND_SPIKE_MULT", "1.5"))
 
-_CATEGORY_EMOJI = {
-    "MATCHED": ":white_check_mark:",
-    "MISMATCHED": ":warning:",
-    "UNRECONCILED_PROCESSOR": ":x:",
-    "UNRECONCILED_INTERNAL": ":x:",
+_CATEGORY_COLORS = {
+    "MATCHED": "#4caf50",
+    "MISMATCHED": "#ff9800",
+    "UNRECONCILED_PROCESSOR": "#f44336",
+    "UNRECONCILED_INTERNAL": "#e91e63",
 }
 
 
 def run(
     reference_date: str | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
+    output_dir: str | Path = "output/reports",
 ) -> dict:
     """
-    Evaluates reconciliation health and writes simulated Slack artifacts.
+    Evaluates reconciliation health and writes two SVG charts and a text alert.
 
     Args:
         reference_date: Date to evaluate (YYYY-MM-DD). Defaults to latest available.
+        output_dir:     Directory where output files are written.
 
     Returns:
         Dict with reference_date, run_status, alert_level, alerts list, and output paths.
@@ -63,32 +63,29 @@ def run(
         run_status = _run_status(_conn, ref_date)
         daily = _daily_rates(_conn, ref_date)
         trend = _trend_rates(_conn, ref_date)
+        history = _history_rates(_conn, ref_date, days=30)
         alerts = _evaluate(ref_date, run_status, daily, trend)
 
-        _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        chart_path = _write_chart(ref_date, daily)
-        payload = _block_kit(ref_date, run_status, daily, alerts)
-        payload_path = _OUTPUT_DIR / f"{ref_date}_alert.json"
-        payload_path.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        rates_path = _write_rates_chart(ref_date, daily, out_dir)
+        trend_path = _write_trend_chart(ref_date, history, out_dir)
+        text_path = _write_alert_text(ref_date, run_status, daily, alerts, out_dir)
 
         level = "CRITICAL" if alerts else "OK"
         logger.info(
-            "[SIMULATED SLACK] channel=#ops-alerts level=%s reference_date=%s "
-            "artifacts=[%s, %s]",
-            level,
-            ref_date,
-            chart_path.name,
-            payload_path.name,
+            "Ops alert written — level=%s reference_date=%s artifacts=[%s, %s, %s]",
+            level, ref_date, rates_path.name, trend_path.name, text_path.name,
         )
         return {
             "reference_date": ref_date,
             "run_status": run_status,
             "alert_level": level,
             "alerts": alerts,
-            "chart_path": str(chart_path),
-            "payload_path": str(payload_path),
+            "rates_path": str(rates_path),
+            "trend_path": str(trend_path),
+            "alert_text_path": str(text_path),
         }
     finally:
         if owns_conn:
@@ -152,6 +149,26 @@ def _trend_rates(conn: duckdb.DuckDBPyConnection, ref_date: str) -> list[dict]:
     ]
 
 
+def _history_rates(
+    conn: duckdb.DuckDBPyConnection, ref_date: str, days: int = 30
+) -> list[dict]:
+    rows = conn.execute(f"""
+        SELECT reference_date, category, pct_of_total
+        FROM gold_ops_reconciliation_daily
+        WHERE reference_date > (CAST('{ref_date}' AS DATE) - INTERVAL '{days} days')
+          AND reference_date <= CAST('{ref_date}' AS DATE)
+        ORDER BY reference_date, category
+    """).fetchall()
+    return [
+        {
+            "reference_date": str(r[0]),
+            "category": r[1],
+            "pct_of_total": float(r[2]) if r[2] is not None else 0.0,
+        }
+        for r in rows
+    ]
+
+
 # ─── Alert logic ─────────────────────────────────────────────────────────────
 
 def _evaluate(
@@ -204,43 +221,27 @@ def _evaluate(
     return alerts
 
 
-# ─── Artifact renderers ───────────────────────────────────────────────────────
+# ─── Chart: daily rates bar chart ────────────────────────────────────────────
 
-def _write_chart(ref_date: str, daily: list[dict]) -> Path:
-    svg = _svg_bar_chart(
-        title=f"Reconciliation Rates — {ref_date}",
-        bars=[(r["category"], r["pct_of_total"]) for r in daily],
-    )
-    path = _OUTPUT_DIR / f"{ref_date}_chart.svg"
-    path.write_text(svg, encoding="utf-8")
-    return path
-
-
-def _svg_bar_chart(title: str, bars: list[tuple[str, float]]) -> str:
+def _write_rates_chart(ref_date: str, daily: list[dict], out_dir: Path) -> Path:
     width = 500
     margin = {"top": 44, "right": 24, "bottom": 72, "left": 56}
     chart_w = width - margin["left"] - margin["right"]
     chart_h = 160
     height = chart_h + margin["top"] + margin["bottom"]
 
-    max_val = max((v for _, v in bars), default=1.0) or 1.0
-    n = max(len(bars), 1)
+    bars_data = [(r["category"], r["pct_of_total"]) for r in daily]
+    max_val = max((v for _, v in bars_data), default=1.0) or 1.0
+    n = max(len(bars_data), 1)
     slot = chart_w // n
     bar_w = max(slot * 3 // 4, 4)
 
-    _colors = {
-        "MATCHED": "#4caf50",
-        "MISMATCHED": "#ff9800",
-        "UNRECONCILED_PROCESSOR": "#f44336",
-        "UNRECONCILED_INTERNAL": "#e91e63",
-    }
-
     elements: list[str] = []
-    for i, (label, val) in enumerate(bars):
+    for i, (label, val) in enumerate(bars_data):
         bh = max(int(val / max_val * chart_h), 1)
         x = margin["left"] + i * slot + (slot - bar_w) // 2
         y = margin["top"] + chart_h - bh
-        fill = _colors.get(label, "#9e9e9e")
+        fill = _CATEGORY_COLORS.get(label, "#9e9e9e")
         short = label.replace("UNRECONCILED_", "UNR_")
         cx = x + bar_w // 2
         elements.append(
@@ -251,84 +252,162 @@ def _svg_bar_chart(title: str, bars: list[tuple[str, float]]) -> str:
             f'text-anchor="middle" font-size="9" fill="#555">{short}</text>'
         )
 
-    return (
+    svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
         f'<rect width="{width}" height="{height}" fill="#fafafa" rx="6"/>'
         f'<text x="{width // 2}" y="26" text-anchor="middle" font-size="13" '
-        f'font-weight="bold" fill="#222">{title}</text>'
+        f'font-weight="bold" fill="#222">Reconciliation Rates — {ref_date}</text>'
         + "".join(elements)
         + "</svg>"
     )
+    path = out_dir / f"{ref_date}_rates.svg"
+    path.write_text(svg, encoding="utf-8")
+    return path
 
 
-def _block_kit(
+# ─── Chart: time-series trend line chart ─────────────────────────────────────
+
+def _write_trend_chart(ref_date: str, history: list[dict], out_dir: Path) -> Path:
+    width, height = 600, 280
+    margin = {"top": 44, "right": 120, "bottom": 48, "left": 52}
+    chart_w = width - margin["left"] - margin["right"]
+    chart_h = height - margin["top"] - margin["bottom"]
+
+    # Group by category → list of (date, pct) sorted by date
+    series: dict[str, list[tuple[str, float]]] = {}
+    for row in history:
+        series.setdefault(row["category"], []).append(
+            (row["reference_date"], row["pct_of_total"])
+        )
+    for points in series.values():
+        points.sort(key=lambda x: x[0])
+
+    all_dates = sorted({r["reference_date"] for r in history})
+    if not all_dates:
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+            f'<text x="{width//2}" y="{height//2}" text-anchor="middle" font-size="13" fill="#999">'
+            f'No trend data available</text></svg>'
+        )
+        path = out_dir / f"{ref_date}_trend.svg"
+        path.write_text(svg, encoding="utf-8")
+        return path
+
+    max_pct = max(r["pct_of_total"] for r in history) or 1.0
+    n_dates = max(len(all_dates) - 1, 1)
+    date_index = {d: i for i, d in enumerate(all_dates)}
+
+    def _x(date: str) -> float:
+        return margin["left"] + date_index[date] / n_dates * chart_w
+
+    def _y(pct: float) -> float:
+        return margin["top"] + chart_h - (pct / max_pct * chart_h)
+
+    elements: list[str] = []
+
+    # Y-axis gridlines and labels
+    for tick in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        yy = _y(max_pct * tick)
+        elements.append(
+            f'<line x1="{margin["left"]}" y1="{yy}" x2="{margin["left"] + chart_w}" y2="{yy}" '
+            f'stroke="#e0e0e0" stroke-width="1"/>'
+            f'<text x="{margin["left"] - 4}" y="{yy + 4}" text-anchor="end" '
+            f'font-size="9" fill="#888">{max_pct * tick:.0%}</text>'
+        )
+
+    # X-axis date labels (first, middle, last)
+    label_indices = {0, len(all_dates) // 2, len(all_dates) - 1}
+    for idx in label_indices:
+        if idx < len(all_dates):
+            d = all_dates[idx]
+            xx = _x(d)
+            elements.append(
+                f'<text x="{xx}" y="{margin["top"] + chart_h + 16}" '
+                f'text-anchor="middle" font-size="9" fill="#888">{d}</text>'
+            )
+
+    # Lines per category
+    for cat, points in series.items():
+        color = _CATEGORY_COLORS.get(cat, "#9e9e9e")
+        if len(points) < 2:
+            if points:
+                px, py = _x(points[0][0]), _y(points[0][1])
+                elements.append(
+                    f'<circle cx="{px}" cy="{py}" r="3" fill="{color}"/>'
+                )
+            continue
+        coords = " ".join(f"{_x(d)},{_y(v)}" for d, v in points)
+        elements.append(
+            f'<polyline points="{coords}" fill="none" stroke="{color}" '
+            f'stroke-width="2" stroke-linejoin="round"/>'
+        )
+        # Dot on last point
+        lx, ly = _x(points[-1][0]), _y(points[-1][1])
+        elements.append(f'<circle cx="{lx}" cy="{ly}" r="3" fill="{color}"/>')
+
+    # Legend on the right
+    categories = list(series.keys())
+    for i, cat in enumerate(sorted(categories)):
+        color = _CATEGORY_COLORS.get(cat, "#9e9e9e")
+        short = cat.replace("UNRECONCILED_", "UNR_")
+        ly = margin["top"] + i * 18
+        elements.append(
+            f'<rect x="{margin["left"] + chart_w + 8}" y="{ly}" width="10" height="10" fill="{color}" rx="2"/>'
+            f'<text x="{margin["left"] + chart_w + 22}" y="{ly + 9}" font-size="9" fill="#444">{short}</text>'
+        )
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+        f'<rect width="{width}" height="{height}" fill="#fafafa" rx="6"/>'
+        f'<text x="{(margin["left"] + margin["left"] + chart_w) // 2}" y="26" '
+        f'text-anchor="middle" font-size="13" font-weight="bold" fill="#222">'
+        f'Reconciliation Trend (last 30 days)</text>'
+        + "".join(elements)
+        + "</svg>"
+    )
+    path = out_dir / f"{ref_date}_trend.svg"
+    path.write_text(svg, encoding="utf-8")
+    return path
+
+
+# ─── Text alert ──────────────────────────────────────────────────────────────
+
+def _write_alert_text(
     ref_date: str,
     run_status: str,
     daily: list[dict],
     alerts: list[dict],
-) -> dict:
-    level_icon = ":red_circle:" if alerts else ":large_green_circle:"
-    level_text = "CRITICAL" if alerts else "OK"
+    out_dir: Path,
+) -> Path:
+    level = "CRITICAL" if alerts else "OK"
     total = sum(r["txn_count"] for r in daily)
     matched_pct = next(
         (r["pct_of_total"] for r in daily if r["category"] == "MATCHED"), 0.0
     )
 
-    rate_lines = "\n".join(
-        f"  {_CATEGORY_EMOJI.get(r['category'], '•')} *{r['category']}*: "
-        f"{r['pct_of_total']:.1%} ({r['txn_count']:,} txns)"
-        for r in daily
-    )
+    lines: list[str] = [
+        f"Reconciliation Alert — {ref_date}",
+        "=" * 40,
+        f"Status      : {level}",
+        f"Run status  : {run_status}",
+        f"Total txns  : {total:,}",
+        f"Match rate  : {matched_pct:.1%}",
+        "",
+        "Category breakdown:",
+    ]
+    for r in daily:
+        lines.append(f"  {r['category']:<30} {r['pct_of_total']:.1%}  ({r['txn_count']:,} txns)")
 
-    alert_blocks: list[dict] = []
     if alerts:
-        alert_text = "\n".join(f"  :warning: {a['message']}" for a in alerts)
-        alert_blocks = [
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Active Alerts*\n{alert_text}"},
-            },
-            {"type": "divider"},
-        ]
+        lines += ["", "Active alerts:"]
+        for a in alerts:
+            lines.append(f"  [!] {a['message']}")
+    else:
+        lines += ["", "No alerts — all rates within thresholds."]
 
-    return {
-        "blocks": [
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": f"{level_icon} Reconciliation {level_text} — {ref_date}",
-                },
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Status*\n{level_text}"},
-                    {"type": "mrkdwn", "text": f"*Run Status*\n{run_status}"},
-                    {"type": "mrkdwn", "text": f"*Total Transactions*\n{total:,}"},
-                    {"type": "mrkdwn", "text": f"*Match Rate*\n{matched_pct:.1%}"},
-                ],
-            },
-            {"type": "divider"},
-            *alert_blocks,
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Category Breakdown*\n{rate_lines}",
-                },
-            },
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"_Reference date: {ref_date} · Simulated Slack delivery_",
-                    }
-                ],
-            },
-        ]
-    }
+    path = out_dir / f"{ref_date}_alert.txt"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 if __name__ == "__main__":
@@ -339,5 +418,6 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
     ref = sys.argv[1] if len(sys.argv) > 1 else None
-    result = run(reference_date=ref)
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else "output/reports"
+    result = run(reference_date=ref, output_dir=out_dir)
     print(json.dumps(result, indent=2, default=str))
