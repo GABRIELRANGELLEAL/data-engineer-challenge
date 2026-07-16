@@ -1,0 +1,3 @@
+transaction_id,merchant_id,amount,currency,settled_at,processor_reference,status
+93f98e53-ea04-47bf-b615-5fd0913bd9c1,MERCH_0049,47.14,BRL,2025-04-04T13:31:13Z,PS-2025-0000007237,SETTLED
+d6bfafb1-4ab4-47e3-9f73-94c454050c61,MERCH_0016,43.68,BRL,2025-04-04T02:45:52Z,PS-2025-0000009021,SETTLED

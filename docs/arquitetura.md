@@ -42,10 +42,9 @@ docs/sample-data/                       scripts/generate_sample_data.py
     │  gold_compliance_ledger          (VIEW)              │
     └──────────────────┬───────────────────────────────────┘
                        │
-              ┌────────┴────────┐
-              ▼                 ▼
-    output/alerts/          output/reports/
-    {date}_alert.json       {week}_cfo_report.html
+                       ▼
+                  outputs/
+    {date}_alert.json    {start}_{end}_cfo_report.html
     {date}_chart.svg
 ```
 

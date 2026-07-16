@@ -3,6 +3,7 @@ data/
 bronze/
 silver/
 gold/
+outputs/
 *.duckdb
 *.duckdb.wal
 _delta_log/

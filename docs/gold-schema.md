@@ -69,8 +69,9 @@ PostgreSQL (settlement_db)
         │
         ▼
   Outputs
-  ├── output/alerts/{date}_alert.json + _chart.svg
-  └── output/reports/{week}_cfo_report.html
+  └── outputs/
+        ├── {date}_alert.json + _chart.svg
+        └── {start}_{end}_cfo_report.html
 ```
 
 ---
@@ -298,19 +299,19 @@ by `week_start` and only rebuild the current (open) week, leaving prior weeks un
 
 ```bash
 # 1. Seed silver (if not already done)
-python -m src.silver.cdc_reconc_historical_load \
+python -m src.b_silver.cdc_reconc \
     docs/sample-data/reconciliation_runs.parquet \
     docs/sample-data/reconciliation_results.parquet
 
-python -m src.silver.enterprise_company \
+python -m src.b_silver.cdc_company \
     docs/sample-data/enterprise_company.parquet
 
 # 2. Build gold
-python -m src.gold.build
+python -m src.c_gold.build
 
 # 3. Run outputs
-python -m src.outputs.ops_alert              # defaults to latest reference_date
-python -m src.outputs.cfo_report             # defaults to latest week_start
+python -m src.products.ops_alert             # defaults to latest reference_date
+python -m src.products.cfo_report            # aggregates the entire available period
 
 # Or via make
 make build-gold

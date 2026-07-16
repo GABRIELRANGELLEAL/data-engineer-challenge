@@ -256,15 +256,15 @@ docker compose exec pipeline python -m src.silver.reconcile 2025-03-15
 make build-gold
 
 # 5. Gerar artefatos de saída
-make run-alerts        # output/alerts/{date}_alert.json + _chart.svg
-make run-cfo-report    # output/reports/{week}_cfo_report.html
+make run-alerts        # outputs/{date}_alert.json + _chart.svg
+make run-cfo-report    # outputs/{start}_{end}_cfo_report.html
 
 # 6. (Opcional) Rodar os testes
 make test
 
 # 7. (Opcional) Gerar dados sintéticos em escala
-make generate          # 10k linhas em /tmp/generated
-make generate-large    # 1M linhas em /tmp/generated-large
+make generate          # 10k linhas em docs/sample-data
+make generate-large    # 1M linhas em docs/sample-data
 ```
 
 O banco DuckDB persiste em `data/warehouse.duckdb`. Para inspecionar diretamente:

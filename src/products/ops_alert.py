@@ -39,7 +39,7 @@ _CATEGORY_EMOJI = {
 def run(
     reference_date: str | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
-    output_dir: str | Path = "output/reports",
+    output_dir: str | Path = "outputs",
 ) -> dict:
     """
     Evaluates reconciliation health and writes alert artifacts.
@@ -339,6 +339,6 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
     ref = sys.argv[1] if len(sys.argv) > 1 else None
-    out_dir = sys.argv[2] if len(sys.argv) > 2 else "output/reports"
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else "outputs"
     result = run(reference_date=ref, output_dir=out_dir)
     print(json.dumps(result, indent=2, default=str))
