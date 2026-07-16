@@ -1,5 +1,18 @@
+"""
+Silver seeder for reconciliation_runs / reconciliation_results.
+
+Applies CDC (latest-wins by _timestamp, excludes Op='D') on top of the bronze
+raw extracts (raw_reconciliation_runs, raw_reconciliation_results) and
+(re)builds silver_reconciliation_runs / silver_reconciliation_results from
+scratch. Idempotent — safe to run as many times as needed; each run fully
+replaces both tables based on whatever is currently in bronze.
+
+The curated "current" view (winning run + merchant enrichment) is built
+separately by src.b_silver.build, since it depends on silver_enterprise_company
+also being seeded.
+"""
 import logging
-from pathlib import Path
+import sys
 
 import duckdb
 
@@ -7,120 +20,54 @@ from src.db import get_connection
 
 logger = logging.getLogger(__name__)
 
-_CREATE_RUNS = """
-CREATE TABLE IF NOT EXISTS silver_reconciliation_runs (
-    id                 BIGINT PRIMARY KEY,
-    reference_date     DATE NOT NULL,
-    file_name          VARCHAR,
-    status             VARCHAR NOT NULL,
-    total_transactions INTEGER,
-    started_at         TIMESTAMPTZ,
-    completed_at       TIMESTAMPTZ,
-    created_at         TIMESTAMPTZ NOT NULL,
-    source             VARCHAR NOT NULL
-)
-"""
-
-_CREATE_RESULTS = """
-CREATE TABLE IF NOT EXISTS silver_reconciliation_results (
-    id               BIGINT PRIMARY KEY,
-    run_id           BIGINT NOT NULL,
-    transaction_id   VARCHAR NOT NULL,
-    merchant_id      VARCHAR,
-    category         VARCHAR NOT NULL,
-    internal_amount  DECIMAL(18, 2),
-    processor_amount DECIMAL(18, 2),
-    difference       DECIMAL(18, 2),
-    created_at       TIMESTAMPTZ NOT NULL,
-    source           VARCHAR NOT NULL
-)
-"""
-
-_CREATE_CURRENT_VIEW = """
-CREATE OR REPLACE VIEW silver_reconciliation_results_current AS
-WITH latest_runs AS (
-    SELECT reference_date, MAX(id) AS latest_run_id
-    FROM silver_reconciliation_runs
-    WHERE status = 'COMPLETED'
-    GROUP BY reference_date
-)
-SELECT rr.*
-FROM silver_reconciliation_results rr
-JOIN latest_runs lr ON rr.run_id = lr.latest_run_id
-"""
+_REQUIRED_RAW_TABLES = ("raw_reconciliation_runs", "raw_reconciliation_results")
 
 
-def seed(
-    runs_parquet: str | Path,
-    results_parquet: str | Path,
-    force: bool = False,
-    conn: duckdb.DuckDBPyConnection | None = None,
-) -> dict:
+def seed(conn: duckdb.DuckDBPyConnection | None = None) -> dict:
     """
-    One-time historical seed for silver reconciliation tables.
+    (Re)builds silver_reconciliation_runs / silver_reconciliation_results from
+    the bronze raw extracts (raw_reconciliation_runs, raw_reconciliation_results).
 
-    Applies CDC (latest-wins by _timestamp, excludes Op='D') before inserting,
-    then creates DuckDB sequences so reconcile.py can generate collision-free IDs.
+    Applies CDC (latest-wins by _timestamp, excludes Op='D').
 
-    Args:
-        runs_parquet:    Path to reconciliation_runs.parquet.
-        results_parquet: Path to reconciliation_results.parquet.
-        force:           Drop and recreate silver tables if they already have rows.
+    Requires src.a_bronze.reconciliation_runs.load and
+    src.a_bronze.reconciliation_results.load to have already populated the
+    raw tables.
     """
-    runs_path = _to_posix(runs_parquet)
-    results_path = _to_posix(results_parquet)
-
     owns_conn = conn is None
     _conn = conn if conn is not None else get_connection()
 
     try:
-        _conn.execute(_CREATE_RUNS)
-        _conn.execute(_CREATE_RESULTS)
+        _assert_raw_tables_exist(_conn)
 
-        existing = _conn.execute(
-            "SELECT COUNT(*) FROM silver_reconciliation_runs"
-        ).fetchone()[0]
-
-        if existing > 0 and not force:
-            raise RuntimeError(
-                f"silver_reconciliation_runs already has {existing} rows. "
-                "Pass force=True to drop and re-seed (existing computed rows will be lost)."
-            )
-
-        if force and existing > 0:
-            logger.warning("--force: dropping and recreating silver reconciliation tables.")
-            _conn.execute("DROP TABLE IF EXISTS silver_reconciliation_results")
-            _conn.execute("DROP TABLE IF EXISTS silver_reconciliation_runs")
-            _conn.execute(_CREATE_RUNS)
-            _conn.execute(_CREATE_RESULTS)
-
-        _conn.execute(f"""
-            INSERT INTO silver_reconciliation_runs
+        _conn.execute("""
+            CREATE OR REPLACE TABLE silver_reconciliation_runs AS
             WITH ranked AS (
                 SELECT *,
                     ROW_NUMBER() OVER (PARTITION BY id ORDER BY _timestamp DESC) AS _rn
-                FROM read_parquet('{runs_path}')
+                FROM raw_reconciliation_runs
             )
             SELECT
                 id,
-                CAST(reference_date AS DATE),
+                CAST(reference_date AS DATE)      AS reference_date,
                 file_name,
                 status,
-                CAST(total_transactions AS INTEGER),
-                CAST(started_at   AS TIMESTAMPTZ),
-                CAST(completed_at AS TIMESTAMPTZ),
-                CAST(created_at   AS TIMESTAMPTZ),
+                CAST(total_transactions AS INTEGER) AS total_transactions,
+                CAST(started_at   AS TIMESTAMPTZ) AS started_at,
+                CAST(completed_at AS TIMESTAMPTZ) AS completed_at,
+                CAST(created_at   AS TIMESTAMPTZ) AS created_at,
                 'historical_backfill' AS source
             FROM ranked
             WHERE _rn = 1 AND Op != 'D'
         """)
+        _conn.execute("ALTER TABLE silver_reconciliation_runs ADD PRIMARY KEY (id)")
 
-        _conn.execute(f"""
-            INSERT INTO silver_reconciliation_results
+        _conn.execute("""
+            CREATE OR REPLACE TABLE silver_reconciliation_results AS
             WITH ranked AS (
                 SELECT *,
                     ROW_NUMBER() OVER (PARTITION BY id ORDER BY _timestamp DESC) AS _rn
-                FROM read_parquet('{results_path}')
+                FROM raw_reconciliation_results
             )
             SELECT
                 id,
@@ -128,29 +75,15 @@ def seed(
                 transaction_id,
                 merchant_id,
                 category,
-                CAST(internal_amount  AS DECIMAL(18, 2)),
-                CAST(processor_amount AS DECIMAL(18, 2)),
-                CAST(difference       AS DECIMAL(18, 2)),
-                CAST(created_at AS TIMESTAMPTZ),
+                CAST(internal_amount  AS DECIMAL(18, 2)) AS internal_amount,
+                CAST(processor_amount AS DECIMAL(18, 2)) AS processor_amount,
+                CAST(difference       AS DECIMAL(18, 2)) AS difference,
+                CAST(created_at AS TIMESTAMPTZ) AS created_at,
                 'historical_backfill' AS source
             FROM ranked
             WHERE _rn = 1 AND Op != 'D'
         """)
-
-        max_run_id = _conn.execute(
-            "SELECT MAX(id) FROM silver_reconciliation_runs"
-        ).fetchone()[0]
-        max_result_id = _conn.execute(
-            "SELECT MAX(id) FROM silver_reconciliation_results"
-        ).fetchone()[0]
-
-        # Sequences used by reconcile.py to generate collision-free IDs
-        _conn.execute("DROP SEQUENCE IF EXISTS seq_run_id")
-        _conn.execute(f"CREATE SEQUENCE seq_run_id START {max_run_id + 1}")
-        _conn.execute("DROP SEQUENCE IF EXISTS seq_result_id")
-        _conn.execute(f"CREATE SEQUENCE seq_result_id START {max_result_id + 1}")
-
-        _conn.execute(_CREATE_CURRENT_VIEW)
+        _conn.execute("ALTER TABLE silver_reconciliation_results ADD PRIMARY KEY (id)")
 
         runs_loaded = _conn.execute(
             "SELECT COUNT(*) FROM silver_reconciliation_runs"
@@ -160,18 +93,14 @@ def seed(
         ).fetchone()[0]
 
         logger.info(
-            "Seed complete: %d runs, %d results. seq_run_id starts at %d, seq_result_id at %d.",
+            "Seed complete: %d runs, %d results.",
             runs_loaded,
             results_loaded,
-            max_run_id + 1,
-            max_result_id + 1,
         )
 
         return {
             "runs_loaded": runs_loaded,
             "results_loaded": results_loaded,
-            "seq_run_id_start": max_run_id + 1,
-            "seq_result_id_start": max_result_id + 1,
         }
 
     finally:
@@ -179,5 +108,27 @@ def seed(
             _conn.close()
 
 
-def _to_posix(path: str | Path) -> str:
-    return str(Path(path).resolve()).replace("\\", "/")
+def _assert_raw_tables_exist(conn: duckdb.DuckDBPyConnection) -> None:
+    for raw_table in _REQUIRED_RAW_TABLES:
+        exists: bool = conn.execute(
+            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+            [raw_table],
+        ).fetchone()[0]
+        if not exists:
+            raise RuntimeError(
+                f"{raw_table} not found. Run its bronze loader (src.a_bronze.reconciliation_runs "
+                "/ reconciliation_results) before seeding silver."
+            )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    )
+    try:
+        result = seed()
+        print(f"Loaded {result['runs_loaded']} runs, {result['results_loaded']} results.")
+    except Exception as exc:
+        logger.error("Seed failed: %s", exc)
+        sys.exit(1)

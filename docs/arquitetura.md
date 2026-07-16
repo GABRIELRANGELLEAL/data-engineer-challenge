@@ -12,40 +12,53 @@ docs/sample-data/                       scripts/generate_sample_data.py
   ├── reconciliation_runs.parquet    │    (gerador sintético para testes
   ├── reconciliation_results.parquet │     de escala — mesmo schema)
   ├── enterprise_company.parquet    ─┤
-  └── settlement_paysettler.csv    ──┘
+  └── paysettler/settlement_*.csv  ──┘
               │
               ▼
-    ┌──────────────────────────────────────────────────────┐
-    │               Bronze Layer (DuckDB)                  │
-    │  raw_transactions          ← cdc_loader.py           │
-    │  raw_paysettler_settlements ← settlement_loader.py   │
-    └──────────────────┬───────────────────────────────────┘
+    ┌────────────────────────────────────────────────────────────┐
+    │                  Bronze Layer (DuckDB)                     │
+    │  raw_transactions            ← cdc_transaction.py          │
+    │    (única exceção: já sai deduplicada — CDC aplicado aqui) │
+    │  raw_paysettler_settlements  ← settlement_loader.py        │
+    │  raw_reconciliation_runs     ← reconciliation_runs.py      │
+    │  raw_reconciliation_results  ← reconciliation_results.py   │
+    │  raw_enterprise_company      ← enterprise_company.py       │
+    │    (landing puro — sem CDC, sem regra de negócio)          │
+    └──────────────────┬───────────────────────────────────────┘
                        │
                        ▼
-    ┌──────────────────────────────────────────────────────┐
-    │               Silver Layer (DuckDB)                  │
-    │  silver_reconciliation_runs    (append-only)         │
-    │  silver_reconciliation_results (append-only)         │
-    │  silver_enterprise_company     (upsert via CDC)      │
-    │                                                      │
-    │  reconcile.py  ← core de reconciliação + quality    │
-    │                   gates (UNRECONCILED / MISMATCHED)  │
-    └──────────────────┬───────────────────────────────────┘
+    ┌────────────────────────────────────────────────────────────┐
+    │                  Silver Layer (DuckDB)                     │
+    │  silver_reconciliation_runs    (CDC dedup, CREATE OR       │
+    │  silver_reconciliation_results  REPLACE — idempotente)     │
+    │  silver_enterprise_company     (CDC dedup, upsert)         │
+    │                    ← cdc_reconc.py / cdc_company.py        │
+    │                                                            │
+    │  silver_reconciliation_runs_latest      (VIEW curada)      │
+    │  silver_reconciliation_results_current  (VIEW curada,      │
+    │    winning-run + enriquecida com dados do merchant)        │
+    │                    ← build.py                              │
+    └──────────────────┬───────────────────────────────────────┘
                        │
                        ▼
-    ┌──────────────────────────────────────────────────────┐
-    │               Gold Layer (DuckDB)                    │
-    │  gold_ops_reconciliation_daily   (VIEW)              │
-    │  gold_ops_reconciliation_trend   (VIEW)              │
-    │  gold_cfo_weekly_summary         (TABLE snapshot)    │
-    │  gold_cfo_weekly_merchant_ranking (TABLE snapshot)   │
-    │  gold_compliance_ledger          (VIEW)              │
-    └──────────────────┬───────────────────────────────────┘
+    ┌────────────────────────────────────────────────────────────┐
+    │                  Gold Layer (DuckDB)                       │
+    │  gold_ops_reconciliation_daily   (VIEW, 1 linha/dia mesmo  │
+    │                                    se o run mais recente    │
+    │                                    falhou — run_status)     │
+    │  gold_ops_reconciliation_trend   (VIEW)                    │
+    │  gold_cfo_weekly_summary         (TABLE snapshot)          │
+    │  gold_cfo_weekly_merchant_ranking (TABLE snapshot)         │
+    │  gold_compliance_ledger          (VIEW, sem filtro de      │
+    │                                    winning-run — histórico  │
+    │                                    completo p/ auditoria)   │
+    └──────────────────┬───────────────────────────────────────┘
                        │
                        ▼
-                  outputs/
-    {date}_alert.json    {start}_{end}_cfo_report.html
-    {date}_chart.svg
+                  Produtos (leem só gold)
+    ops_alert.py → {date}_alert.json + {date}_chart.svg   (Slack card, Ops)
+    cfo_report.py → {start}_{end}_cfo_report.html          (CFO)
+    gold_compliance_ledger — consultado via SQL direto     (Compliance)
 ```
 
 **Todos os artefatos persistem em `data/warehouse.duckdb` (arquivo local).**
@@ -119,8 +132,8 @@ docker compose logs pipeline --since 72h | grep -E "ERROR|FAILED|Quality gate|re
 ```
 
 **O que procurar:**
-- `Quality gate FAILED` → UNRECONCILED ou MISMATCHED acima do threshold; o run foi abortado antes de inserir resultados
-- `No settlement data in raw_paysettler_settlements` → o CSV do PaySettler não chegou ou não foi carregado no bronze
+- `status = 'FAILED'` nos runs listados no passo 1 → algo interrompeu o processamento antes da conclusão (upstream)
+- Erro do loader bronze (`FileNotFoundError`, `ValueError` de schema) → o CSV/parquet do PaySettler não chegou ou não bateu com o schema esperado
 - Stack trace Python → bug de código ou schema inesperado no arquivo
 
 ### 3. Verificar se o CSV do PaySettler chegou no bronze
@@ -143,16 +156,16 @@ SELECT week_start, SUM(txn_count) FROM gold_cfo_weekly_summary
 GROUP BY week_start ORDER BY week_start DESC LIMIT 5;
 ```
 
-**O que procurar:** se os dados param antes de sexta → `build-gold` não rodou após o pipeline de silver, ou o silver estava vazio quando rodou.
+**O que procurar:** se os dados param antes de sexta → `build-gold` (que já roda `build-silver` como pré-requisito) não rodou após o pipeline de silver, ou o silver estava vazio quando rodou.
 
 ### 5. Decisão de escalação
 
 | Diagnóstico | Ação | Escalação |
 |-------------|------|-----------|
 | CSV não chegou | Confirmar com PaySettler se arquivo foi enviado | Acionar time de integração com PaySettler |
-| Run FAILED por quality gate | Investigar a data específica; rerrodar manualmente após confirmar dados | Avisar Ops sobre janela sem dados |
-| Bug de código (stack trace) | Corrigir e rerrodar; gap de dados é recuperável porque silver é append-only | PR de hotfix + runbook para Ops |
-| gold layer não reconstruída | Rerrodar `make build-gold`; sem perda de dados (silver intacto) | Apenas comunicar SLA de delay |
+| Run com `status = 'FAILED'` no upstream | Investigar a data específica junto ao time responsável pela extração/CDC | Avisar Ops sobre janela sem dados |
+| Bug de código (stack trace) | Corrigir e rerrodar `seed-silver`/`seed-company`; como o seed é sempre `CREATE OR REPLACE` a partir da bronze, basta rodar de novo — não há estado incremental pra reconciliar | PR de hotfix + runbook para Ops |
+| gold layer não reconstruída | Rerrodar `make build-gold`; sem perda de dados (bronze/silver intactos) | Apenas comunicar SLA de delay |
 
 **Regra geral:** até o passo 4, o diagnóstico é solo. Escalação só acontece quando o problema está fora do perímetro do pipeline (CSV do PaySettler, falha de infra, bug não óbvio).
 
@@ -170,9 +183,9 @@ DuckDB não tem modo distribuído. A 5M txns/dia (≈1,8B/ano em `reconciliation
 
 **2. Filesystem local como armazenamento é single point of failure**
 
-`data/warehouse.duckdb` é um arquivo local. Sem replicação, sem backups automáticos, sem acesso concorrente de múltiplos processos. Em produção, qualquer falha de disco destrói a silver layer (append-only mas não durável).
+`data/warehouse.duckdb` é um arquivo local. Sem replicação, sem backups automáticos, sem acesso concorrente de múltiplos processos. Em produção, qualquer falha de disco destrói bronze e silver — hoje ambas só existem dentro desse único arquivo.
 
-*Solução:* separar armazenamento de compute. Bronze e silver persistem em Parquet no S3 particionado por `reference_date`. O warehouse (BigQuery/Redshift) lê de lá. Isso dá durabilidade, acesso concorrente, e permite reruns de qualquer data sem impactar o nó de compute.
+*Solução:* separar armazenamento de compute. Bronze e silver persistem em Parquet no S3 particionado por `reference_date`. O warehouse (BigQuery/Redshift) lê de lá. Isso dá durabilidade, acesso concorrente, e permite re-seedar qualquer data sem impactar o nó de compute.
 
 **3. Rebuild incremental do gold não existe**
 
@@ -182,7 +195,6 @@ As tabelas `gold_cfo_weekly_summary` e `gold_cfo_weekly_merchant_ranking` são r
 
 ### O que não quebra (e por quê)
 
-- **Schema da silver:** append-only com `run_id` + `reference_date` — esse design escala naturalmente, é só particionar por data no storage.
-- **Lógica de reconciliação (`reconcile.py`):** o full outer join sobre um dia é O(N) no volume daquele dia, não da história total. Continua viável mesmo a 5M/dia.
-- **Winning-run policy:** a CTE de `ROW_NUMBER()` sobre runs por data é O(número de runs), não de resultados — microsegundos.
+- **Schema da silver:** chave `run_id` + `reference_date`, particionável por data — esse design escala naturalmente, é só particionar por data no storage. `CREATE OR REPLACE TABLE` no seed é hoje um full-rebuild da silver a partir da bronze; em escala isso viraria um `MERGE`/upsert incremental por partição, mas o schema em si não muda.
+- **Winning-run policy:** centralizada em `silver_reconciliation_results_current` (uma única `ROW_NUMBER()` sobre runs por data, O(número de runs) — não de resultados). Antes era uma CTE copiada em cada SQL da gold; agora todo artefato de gold lê dessa view, então o custo não se multiplica por artefato.
 - **SQL do gold:** portável para qualquer SQL engine. A migração de DuckDB para BigQuery é uma mudança de driver, não de lógica.

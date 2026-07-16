@@ -6,8 +6,9 @@ Evaluates reconciliation health for a reference_date and writes:
   - {output_dir}/{date}_alert.json  — Slack Block Kit payload
 
 Trigger conditions (evaluated in order):
-  1. Latest run for the date has status != COMPLETED (checked in silver — a failed run
-     may have no gold rows at all, so we must check silver_reconciliation_runs directly).
+  1. Latest run for the date has status != COMPLETED (gold_ops_reconciliation_daily always
+     has one row per reference_date — via silver_reconciliation_runs_latest — even when the
+     latest run attempt failed and produced no results).
   2. A category rate exceeds its configured threshold AND is above TREND_SPIKE_MULT × 7-day avg
      (or has no 7-day history yet, in which case the threshold alone triggers).
 
@@ -107,10 +108,9 @@ def _latest_reference_date(conn: duckdb.DuckDBPyConnection) -> str | None:
 
 def _run_status(conn: duckdb.DuckDBPyConnection, ref_date: str) -> str:
     row = conn.execute(f"""
-        SELECT status
-        FROM silver_reconciliation_runs
+        SELECT run_status
+        FROM gold_ops_reconciliation_daily
         WHERE reference_date = CAST('{ref_date}' AS DATE)
-        ORDER BY started_at DESC, id DESC
         LIMIT 1
     """).fetchone()
     return row[0] if row else "NO_RUN"
@@ -121,6 +121,7 @@ def _daily_rates(conn: duckdb.DuckDBPyConnection, ref_date: str) -> list[dict]:
         SELECT category, txn_count, pct_of_total, internal_amount_sum, processor_amount_sum
         FROM gold_ops_reconciliation_daily
         WHERE reference_date = CAST('{ref_date}' AS DATE)
+          AND category IS NOT NULL
         ORDER BY category
     """).fetchall()
     return [

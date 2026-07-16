@@ -11,13 +11,13 @@ docker compose up -d --build
 
 #### 1. Gerar dados de amostra
 ```bash
-make generate                    # 10k linhas em docs/sample-data
-make generate-large              # 1M linhas em docs/sample-data
+make generate           # 10k linhas em docs/sample-data
+make generate-large     # 1M linhas em docs/sample-data
 ```
 
-#### 2. Bronze — carga bruta (dedup, CDC, normalização)
+#### 2. Bronze — landing bruto (sem regra de negócio)
 
-**CDC transactions** (`src/a_bronze/cdc_transaction.py` — une os batches de transações internas e aplica CDC para o snapshot atual em `raw_transactions`):
+**CDC transactions** (`src/a_bronze/cdc_transaction.py` — une os batches de transações internas e já aplica CDC para o snapshot atual em `raw_transactions`; esta é a única tabela bronze que sai deduplicada — as outras três abaixo fazem landing puro):
 ```bash
 make load-cdc-transactions
 # equivalente manual:
@@ -50,37 +50,44 @@ print(f'Total de linhas em raw_paysettler_settlements: {total}')
 "
 ```
 
-#### 3. Silver — camada curada (append-only, quality gates, audit trail)
-
-**CDC reconc** (`src/b_silver/cdc_reconc.py` — seed histórico de `silver_reconciliation_runs`/`silver_reconciliation_results` a partir dos parquets de exemplo):
+**Reconciliation runs / results / enterprise company** (`src/a_bronze/reconciliation_runs.py`, `reconciliation_results.py`, `enterprise_company.py` — landing puro do parquet, sem CDC; a dedup fica por conta da silver no passo 3):
 ```bash
-make seed-silver
-# equivalente manual:
-docker compose exec pipeline python -c "
-from src.b_silver.cdc_reconc import seed
-seed('docs/sample-data/reconciliation_runs.parquet', 'docs/sample-data/reconciliation_results.parquet')
-"
+make load-reconciliation-runs
+make load-reconciliation-results
+make load-enterprise-company
+# equivalente manual (mesmo padrão para os três):
+docker compose exec pipeline python -m src.a_bronze.reconciliation_runs docs/sample-data/reconciliation_runs.parquet
+docker compose exec pipeline python -m src.a_bronze.reconciliation_results docs/sample-data/reconciliation_results.parquet
+docker compose exec pipeline python -m src.a_bronze.enterprise_company docs/sample-data/enterprise_company.parquet
 ```
 
-Reconciliação incremental para uma data específica (`src/b_silver/reconcile.py`, após rodar o bronze do passo 2):
+#### 3. Silver — CDC dedup + views curadas
+
+**CDC reconc** (`src/b_silver/cdc_reconc.py` — (re)constrói `silver_reconciliation_runs`/`silver_reconciliation_results` do zero a partir de `raw_reconciliation_runs`/`raw_reconciliation_results`, aplicando CDC dedup; `CREATE OR REPLACE TABLE`, idempotente — pode rodar quantas vezes quiser):
 ```bash
-docker compose exec pipeline python -c "
-from src.b_silver.reconcile import reconcile
-reconcile('2025-03-15')
-"
+make seed-silver        # já roda os load-reconciliation-* da bronze como pré-requisito
+# equivalente manual:
+docker compose exec pipeline python -m src.b_silver.cdc_reconc
 ```
 
-**CDC company** (`src/b_silver/cdc_company.py` — dados cadastrais dos merchants → `silver_enterprise_company`):
+**CDC company** (`src/b_silver/cdc_company.py` — (re)constrói `silver_enterprise_company` do zero a partir de `raw_enterprise_company`; `CREATE OR REPLACE TABLE`, idempotente):
 ```bash
-make seed-company
+make seed-company       # já roda o load-enterprise-company da bronze como pré-requisito
 # equivalente manual:
-docker compose exec pipeline python -m src.b_silver.cdc_company \
-    docs/sample-data/enterprise_company.parquet
+docker compose exec pipeline python -m src.b_silver.cdc_company
+```
+
+**Views curadas** (`src/b_silver/build.py` — constrói `silver_reconciliation_runs_latest` e `silver_reconciliation_results_current`: filtram pelo winning-run e enriquecem com dados do merchant, centralizando essa lógica para a gold layer não precisar repeti-la):
+```bash
+make build-silver        # já roda seed-silver + seed-company como pré-requisito
+# equivalente manual:
+docker compose exec pipeline python -m src.b_silver.build
 ```
 
 #### 4. Gold — views e tabelas analíticas por consumidor
 ```bash
-make build-gold
+make build-gold           # roda build-silver como pré-requisito — a cadeia inteira é idempotente,
+                           # pode rodar quantas vezes quiser
 # equivalente manual:
 docker compose exec pipeline python -m src.c_gold.build
 ```
@@ -89,6 +96,7 @@ docker compose exec pipeline python -m src.c_gold.build
 ```bash
 make run-alerts        # outputs/{date}_alert.json + _chart.svg (Ops)
 make run-cfo-report    # outputs/{start}_{end}_cfo_report.html (CFO)
+# Compliance não tem script — gold_compliance_ledger é consultado via SQL direto
 ```
 
 #### 6. (Opcional) Testes
@@ -103,4 +111,9 @@ docker compose exec pipeline python -c "
 import duckdb; conn = duckdb.connect('data/warehouse.duckdb')
 print(conn.execute('SHOW TABLES').fetchdf())
 "
+```
+
+Stop the container
+```bash
+docker compose down
 ```

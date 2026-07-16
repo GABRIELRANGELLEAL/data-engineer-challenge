@@ -4,18 +4,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       # paths
-      - DATA_PATH=/app/docs/sample-data
       - DB_PATH=/app/data/warehouse.duckdb
       - OUTPUT_DIR=/app/outputs
       - LOG_LEVEL=INFO
       - ENVIRONMENT=local
-      # generation parameters — override on the CLI with -e to scale up
-      # e.g.: docker compose run -e GEN_ROWS=1000000 pipeline
-      - GEN_ROWS=10000
-      - GEN_DAYS=30
-      - GEN_MERCHANTS=100
-      - GEN_SEED=42
-      - GEN_DIRTY=true
     volumes:
       - ./docs/sample-data:/app/docs/sample-data
       - ./scripts:/app/scripts

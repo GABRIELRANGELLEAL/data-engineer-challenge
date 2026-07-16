@@ -1,13 +1,14 @@
 """
 CFO reconciliation report producer.
 
-Aggregates the entire available history from gold_cfo_weekly_summary and
-gold_cfo_weekly_merchant_ranking and renders an HTML report with:
+Aggregates the entire available history from gold_cfo_weekly_summary,
+gold_cfo_weekly_merchant_ranking, and gold_ops_reconciliation_daily, and
+renders an HTML report with:
   - KPI headline (total BRL volume, total transactions)
   - Volume by category — total (SVG bar chart + table)
   - Volume by category — per day (stacked SVG bar chart + table), queried from
-    silver_reconciliation_results (winning-run per reference_date) since the
-    weekly gold tables don't carry daily grain
+    gold_ops_reconciliation_daily since the weekly gold tables don't carry
+    daily grain
   - Top-N merchant risk ranking summed across the full period (default N=10,
     overridable via CFO_REPORT_TOP_N)
 
@@ -114,35 +115,22 @@ def _get_full_summary(conn: duckdb.DuckDBPyConnection) -> list[dict]:
 
 def _get_daily_by_category(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """
-    Daily category volumes across the entire period, from silver_reconciliation_results.
-    The weekly gold tables only carry week grain, so daily breakdown needs the same
-    winning-run-per-reference_date policy applied directly against silver here.
+    Daily category volumes across the entire period, from gold_ops_reconciliation_daily.
+    That view already applies the winning-run-per-reference_date policy in silver.
+    amount_brl = COALESCE(processor_amount_sum, internal_amount_sum): within a single
+    category, processor_amount is either always present or always NULL (that's what
+    defines the category), so this is equivalent to CFO's row-wise
+    COALESCE(processor_amount, internal_amount) convention, just pre-aggregated.
     """
     rows = conn.execute("""
-        WITH winning_runs AS (
-            SELECT reference_date, id AS run_id
-            FROM (
-                SELECT
-                    reference_date,
-                    id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY reference_date
-                        ORDER BY started_at DESC, id DESC
-                    ) AS rn
-                FROM silver_reconciliation_runs
-                WHERE status = 'COMPLETED'
-            ) ranked
-            WHERE rn = 1
-        )
         SELECT
-            wr.reference_date,
-            rr.category,
-            COUNT(*)                                                AS txn_count,
-            SUM(COALESCE(rr.processor_amount, rr.internal_amount)) AS amount_brl
-        FROM silver_reconciliation_results rr
-        JOIN winning_runs wr ON rr.run_id = wr.run_id
-        GROUP BY wr.reference_date, rr.category
-        ORDER BY wr.reference_date, rr.category
+            reference_date,
+            category,
+            txn_count,
+            COALESCE(processor_amount_sum, internal_amount_sum) AS amount_brl
+        FROM gold_ops_reconciliation_daily
+        WHERE category IS NOT NULL
+        ORDER BY reference_date, category
     """).fetchall()
     return [
         {
@@ -400,7 +388,7 @@ def _render_html(
 
   <div class="footer">
     Data source: <code>gold_cfo_weekly_summary</code>, <code>gold_cfo_weekly_merchant_ranking</code>,
-    <code>silver_reconciliation_results</code> &bull; Generated automatically
+    <code>gold_ops_reconciliation_daily</code> &bull; Generated automatically
   </div>
 </body>
 </html>"""

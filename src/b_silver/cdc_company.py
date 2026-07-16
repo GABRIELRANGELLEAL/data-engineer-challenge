@@ -1,12 +1,13 @@
 """
 Silver seeder for enterprise_company (merchant master data).
 
-Applies CDC (latest-wins by _timestamp, excludes Op='D') and loads the result
-into silver_enterprise_company, which is consumed by the gold layer for enrichment.
+Applies CDC (latest-wins by _timestamp, excludes Op='D') on top of the bronze
+raw extract (raw_enterprise_company) and (re)builds silver_enterprise_company
+from scratch. Idempotent — safe to run as many times as needed; each run
+fully replaces the table based on whatever is currently in bronze.
 """
 import logging
 import sys
-from pathlib import Path
 
 import duckdb
 
@@ -14,64 +15,33 @@ from src.db import get_connection
 
 logger = logging.getLogger(__name__)
 
-_CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS silver_enterprise_company (
-    id           BIGINT PRIMARY KEY,
-    merchant_id  VARCHAR NOT NULL,
-    legal_name   VARCHAR,
-    trade_name   VARCHAR,
-    document     VARCHAR,
-    primary_cnae VARCHAR,
-    created_at   TIMESTAMPTZ,
-    updated_at   TIMESTAMPTZ
-)
-"""
+_REQUIRED_RAW_TABLE = "raw_enterprise_company"
 
 
-def seed(
-    parquet_path: str | Path,
-    force: bool = False,
-    conn: duckdb.DuckDBPyConnection | None = None,
-) -> int:
+def seed(conn: duckdb.DuckDBPyConnection | None = None) -> int:
     """
-    Loads enterprise_company.parquet into silver_enterprise_company.
+    (Re)builds silver_enterprise_company from raw_enterprise_company (bronze).
 
     Applies CDC: latest row per id (by _timestamp DESC), deletes excluded.
 
-    Args:
-        parquet_path: Path to enterprise_company.parquet.
-        force:        Drop existing rows and re-seed if the table already has data.
+    Requires src.a_bronze.enterprise_company.load to have already populated
+    the raw table.
 
     Returns:
         Number of rows loaded.
     """
-    path = _to_posix(parquet_path)
-
     owns_conn = conn is None
     _conn = conn if conn is not None else get_connection()
 
     try:
-        _conn.execute(_CREATE_TABLE)
+        _assert_raw_table_exists(_conn)
 
-        existing = _conn.execute(
-            "SELECT COUNT(*) FROM silver_enterprise_company"
-        ).fetchone()[0]
-
-        if existing > 0 and not force:
-            raise RuntimeError(
-                f"silver_enterprise_company already has {existing} rows. "
-                "Pass force=True to drop and re-seed."
-            )
-        if force and existing > 0:
-            logger.warning("--force: truncating silver_enterprise_company.")
-            _conn.execute("DELETE FROM silver_enterprise_company")
-
-        _conn.execute(f"""
-            INSERT INTO silver_enterprise_company
+        _conn.execute("""
+            CREATE OR REPLACE TABLE silver_enterprise_company AS
             WITH ranked AS (
                 SELECT *,
                     ROW_NUMBER() OVER (PARTITION BY id ORDER BY _timestamp DESC) AS _rn
-                FROM read_parquet('{path}')
+                FROM raw_enterprise_company
             )
             SELECT
                 id,
@@ -80,11 +50,12 @@ def seed(
                 trade_name,
                 document,
                 primary_cnae,
-                CAST(created_at AS TIMESTAMPTZ),
-                CAST(updated_at AS TIMESTAMPTZ)
+                CAST(created_at AS TIMESTAMPTZ) AS created_at,
+                CAST(updated_at AS TIMESTAMPTZ) AS updated_at
             FROM ranked
             WHERE _rn = 1 AND Op != 'D'
         """)
+        _conn.execute("ALTER TABLE silver_enterprise_company ADD PRIMARY KEY (id)")
 
         count: int = _conn.execute(
             "SELECT COUNT(*) FROM silver_enterprise_company"
@@ -97,24 +68,25 @@ def seed(
             _conn.close()
 
 
-def _to_posix(path: str | Path) -> str:
-    return str(Path(path).resolve()).replace("\\", "/")
+def _assert_raw_table_exists(conn: duckdb.DuckDBPyConnection) -> None:
+    exists: bool = conn.execute(
+        "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+        [_REQUIRED_RAW_TABLE],
+    ).fetchone()[0]
+    if not exists:
+        raise RuntimeError(
+            f"{_REQUIRED_RAW_TABLE} not found. Run src.a_bronze.enterprise_company "
+            "before seeding silver."
+        )
 
 
 if __name__ == "__main__":
-    import argparse
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
-    parser = argparse.ArgumentParser(description="Seed silver_enterprise_company from parquet.")
-    parser.add_argument("parquet", help="Path to enterprise_company.parquet")
-    parser.add_argument("--force", action="store_true", help="Drop and re-seed if table already has rows")
-    args = parser.parse_args()
-
     try:
-        n = seed(args.parquet, force=args.force)
+        n = seed()
         print(f"Loaded {n} merchants.")
     except Exception as exc:
         logger.error("Seed failed: %s", exc)

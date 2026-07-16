@@ -26,6 +26,8 @@
 
 Ops precisa de **sinal de saúde em tempo real** para agir hoje, não de relatórios retrospectivos. O design escolheu `VIEW` (não table materializada) justamente para garantir que o dado reflita sempre o estado mais recente da silver layer, sem delay de rebuild. A adição da média móvel de 7 dias (`pct_of_total_7d_avg`) no trend resolve o problema de "subindo ou é flutuação normal?"
 
+`gold_ops_reconciliation_daily` garante exatamente uma linha por `reference_date` — mesmo quando a última tentativa de run falhou e não produziu resultados (`category` fica NULL, `run_status` carrega o motivo). Isso permite que `ops_alert.py` detecte um run `FAILED` consultando só a gold, sem precisar acessar a silver diretamente.
+
 ---
 
 ## CFO

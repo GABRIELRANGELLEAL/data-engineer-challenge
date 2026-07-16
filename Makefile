@@ -1,6 +1,7 @@
 .PHONY: help up down build shell logs test test-generate-sample-data generate generate-large clean \
-        load-cdc-transactions load-settlement seed-silver seed-company build-gold \
-        run-alerts run-cfo-report run-pipeline run-pipeline-large
+        load-cdc-transactions load-settlement load-reconciliation-runs load-reconciliation-results \
+        load-enterprise-company seed-silver seed-company build-silver build-gold \
+        run-alerts run-cfo-report
 .DEFAULT_GOAL := help
 
 COMPOSE := docker compose
@@ -46,17 +47,31 @@ load-settlement: ## Bronze: load all PaySettler CSVs from docs/sample-data/payse
 	$(PIPELINE) python -c "from src.a_bronze.settlement_loader import load_directory; from src.db import get_connection; conn = get_connection(); results = load_directory('docs/sample-data/paysettler', r'(\d{4}-\d{2}-\d{2})', conn=conn); total = conn.execute('SELECT COUNT(*) FROM raw_paysettler_settlements').fetchone()[0]; print(f'Arquivos processados: {len(results)}'); print(f'Total de linhas em raw_paysettler_settlements: {total}')"
 	$(PIPELINE) python scripts/print_health.py raw_paysettler_settlements --pk transaction_id,reference_date
 
-seed-silver: ## Silver: seed reconciliation tables (historical) from sample parquets
-	$(PIPELINE) python -c "from src.b_silver.cdc_reconc import seed; seed('docs/sample-data/reconciliation_runs.parquet', 'docs/sample-data/reconciliation_results.parquet')"
+load-reconciliation-runs: ## Bronze: load reconciliation_runs.parquet into raw_reconciliation_runs
+	$(PIPELINE) python -m src.a_bronze.reconciliation_runs docs/sample-data/reconciliation_runs.parquet
+	$(PIPELINE) python scripts/print_health.py raw_reconciliation_runs --pk id
+
+load-reconciliation-results: ## Bronze: load reconciliation_results.parquet into raw_reconciliation_results
+	$(PIPELINE) python -m src.a_bronze.reconciliation_results docs/sample-data/reconciliation_results.parquet
+	$(PIPELINE) python scripts/print_health.py raw_reconciliation_results --pk id
+
+load-enterprise-company: ## Bronze: load enterprise_company.parquet into raw_enterprise_company
+	$(PIPELINE) python -m src.a_bronze.enterprise_company docs/sample-data/enterprise_company.parquet
+	$(PIPELINE) python scripts/print_health.py raw_enterprise_company --pk id
+
+seed-silver: load-reconciliation-runs load-reconciliation-results ## Silver: (re)build reconciliation tables from bronze raw extracts (CREATE OR REPLACE, idempotent)
+	$(PIPELINE) python -m src.b_silver.cdc_reconc
 	$(PIPELINE) python scripts/print_health.py silver_reconciliation_runs --pk id
 	$(PIPELINE) python scripts/print_health.py silver_reconciliation_results --pk id
 
-seed-company: ## Silver: seed silver_enterprise_company from sample parquet
-	$(PIPELINE) python -m src.b_silver.cdc_company \
-		docs/sample-data/enterprise_company.parquet
+seed-company: load-enterprise-company ## Silver: (re)build silver_enterprise_company from bronze raw extract (CREATE OR REPLACE, idempotent)
+	$(PIPELINE) python -m src.b_silver.cdc_company
 	$(PIPELINE) python scripts/print_health.py silver_enterprise_company --pk id
 
-build-gold: ## Gold: build gold layer views and tables
+build-silver: seed-silver seed-company ## Silver: build curated views (winning-run + enrichment)
+	$(PIPELINE) python -m src.b_silver.build
+
+build-gold: build-silver ## Gold: build gold layer views and tables
 	$(PIPELINE) python -m src.c_gold.build
 
 run-alerts: ## Run ops alert for the latest reconciled date
@@ -64,13 +79,6 @@ run-alerts: ## Run ops alert for the latest reconciled date
 
 run-cfo-report: ## Render CFO report for the entire available period
 	$(PIPELINE) python -m src.products.cfo_report
-
-run-pipeline: ## Run the full pipeline with small data (10k rows, 30 days, 100 merchants)
-	$(PIPELINE) python scripts/run_pipeline.py
-
-run-pipeline-large: ## Run the full pipeline with large data (1M rows, 90 days, 500 merchants)
-	$(PIPELINE) env GEN_ROWS=1000000 GEN_DAYS=90 GEN_MERCHANTS=500 \
-		python scripts/run_pipeline.py
 
 clean: ## Remove generated artifacts and stop the container
 	-$(PIPELINE) rm -rf docs/sample-data/*
