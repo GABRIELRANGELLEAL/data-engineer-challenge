@@ -97,10 +97,10 @@ A VIEW nao tem output HTML/JSON associado — o consumo se da diretamente via qu
 docker compose up -d --build
 
 # 2. Pipeline completo (gera dados + bronze + silver + gold + outputs)
-make run_pipeline
+make run_pipeline 
 ```
 
-Isso executa toda a cadeia: geracao de dados sinteticos (10k linhas), carga bronze, dedup silver, construcao gold e geracao de todos os outputs em `outputs/`.
+Isso executa toda a cadeia: geração de dados sinteticos (10k linhas), carga bronze, dedup silver, construcao gold e geracao de todos os outputs em `outputs/`.
 
 ### Passo a passo manual (se preferir)
 
