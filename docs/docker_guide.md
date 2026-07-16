@@ -7,6 +7,11 @@ cd /mnt/c/Users/Leal/data-engineer-challenge
 docker compose up -d --build
 ```
 
+### Roda o pipeline
+```bash
+make run_pipeline
+```
+
 ### Passo a passo manual (mesmas etapas do pipeline, uma por uma)
 
 #### 1. Gerar dados de amostra
@@ -29,6 +34,16 @@ load_transactions([
 ])
 "
 ```
+**Reconciliation runs / results / enterprise company** (`src/a_bronze/reconciliation_runs.py`, `reconciliation_results.py`, `enterprise_company.py` — landing puro do parquet, sem CDC; a dedup fica por conta da silver no passo 3):
+```bash
+make load-reconciliation-runs
+make load-reconciliation-results
+make load-enterprise-company
+# equivalente manual (mesmo padrão para os três):
+docker compose exec pipeline python -m src.a_bronze.reconciliation_runs docs/sample-data/reconciliation_runs.parquet
+docker compose exec pipeline python -m src.a_bronze.reconciliation_results docs/sample-data/reconciliation_results.parquet
+docker compose exec pipeline python -m src.a_bronze.enterprise_company docs/sample-data/enterprise_company.parquet
+```
 
 **Settlement loader (PaySettler CSV)** (`src/a_bronze/settlement_loader.py` — carrega todos os CSVs diários da pasta em `raw_paysettler_settlements`; imprime quantos arquivos foram processados e o total de linhas na tabela):
 ```bash
@@ -50,16 +65,6 @@ print(f'Total de linhas em raw_paysettler_settlements: {total}')
 "
 ```
 
-**Reconciliation runs / results / enterprise company** (`src/a_bronze/reconciliation_runs.py`, `reconciliation_results.py`, `enterprise_company.py` — landing puro do parquet, sem CDC; a dedup fica por conta da silver no passo 3):
-```bash
-make load-reconciliation-runs
-make load-reconciliation-results
-make load-enterprise-company
-# equivalente manual (mesmo padrão para os três):
-docker compose exec pipeline python -m src.a_bronze.reconciliation_runs docs/sample-data/reconciliation_runs.parquet
-docker compose exec pipeline python -m src.a_bronze.reconciliation_results docs/sample-data/reconciliation_results.parquet
-docker compose exec pipeline python -m src.a_bronze.enterprise_company docs/sample-data/enterprise_company.parquet
-```
 
 #### 3. Silver — CDC dedup + views curadas
 
@@ -94,8 +99,11 @@ docker compose exec pipeline python -m src.c_gold.build
 
 #### 5. Produtos de dados — outputs finais
 ```bash
-make run-alerts        # outputs/{date}_alert.json + _chart.svg (Ops)
-make run-cfo-report    # outputs/{start}_{end}_cfo_report.html (CFO)
+make run-alerts           # outputs/{date}_alert.json + _chart.svg (Ops)
+make run-ops-run-report   # outputs/{date}_ops_run_report.html — todas as tentativas de run
+                           # (falhadas ou não) dos últimos 8 dias (data + 7 dias antes),
+                           # via gold_ops_run_history (Ops)
+make run-cfo-report        # outputs/{start}_{end}_cfo_report.html (CFO)
 # Compliance não tem script — gold_compliance_ledger é consultado via SQL direto
 ```
 

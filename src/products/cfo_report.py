@@ -202,8 +202,86 @@ def _summary_chart(summary: list[dict]) -> str:
     )
 
 
+_MATCHED_CATEGORIES = ("MATCHED",)
+_NON_MATCHED_CATEGORIES = tuple(c for c in _RISK_CATEGORIES if c != "MATCHED")
+
+
+def _line_chart_svg(
+    by_date: dict[str, dict[str, float]], dates: list[str], categories: tuple[str, ...]
+) -> str:
+    """Multi-series SVG line chart of BRL volume for the given categories, one point per day."""
+    margin = {"top": 20, "right": 16, "bottom": 60, "left": 70}
+    chart_h = 160
+    slot = 26
+    chart_w = max(len(dates) - 1, 1) * slot
+    width = margin["left"] + chart_w + margin["right"]
+    show_legend = len(categories) > 1
+    height = margin["top"] + chart_h + margin["bottom"] + (16 if show_legend else 0)
+
+    max_val = max(
+        (by_date[d].get(cat, 0.0) for d in dates for cat in categories), default=0.0
+    ) or 1.0
+
+    def y_of(amt: float) -> float:
+        return margin["top"] + chart_h - (amt / max_val * chart_h)
+
+    elements: list[str] = []
+
+    # Y-axis gridlines + value labels (0%, 25%, 50%, 75%, 100% of max).
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        gy = y_of(max_val * frac)
+        elements.append(
+            f'<line x1="{margin["left"]}" y1="{gy:.1f}" x2="{margin["left"] + chart_w}" y2="{gy:.1f}" '
+            f'stroke="#eee" stroke-width="1"/>'
+            f'<text x="{margin["left"] - 6}" y="{gy + 3:.1f}" text-anchor="end" font-size="9" fill="#888">'
+            f'R$ {max_val * frac:,.0f}</text>'
+        )
+
+    # One polyline + markers per category.
+    for cat in categories:
+        color = _CATEGORY_COLORS.get(cat, "#9e9e9e")
+        points = [
+            (margin["left"] + i * slot, y_of(by_date[d].get(cat, 0.0)))
+            for i, d in enumerate(dates)
+        ]
+        path = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        elements.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2"/>')
+        for (x, y), d in zip(points, dates):
+            amt = by_date[d].get(cat, 0.0)
+            elements.append(
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{color}">'
+                f'<title>{d} — {cat}: R$ {amt:,.2f}</title></circle>'
+            )
+
+    # X-axis day labels.
+    for i, d in enumerate(dates):
+        label_x = margin["left"] + i * slot
+        label_y = margin["top"] + chart_h + 14
+        elements.append(
+            f'<text x="{label_x:.1f}" y="{label_y}" text-anchor="end" font-size="9" fill="#555" '
+            f'transform="rotate(-60 {label_x:.1f} {label_y})">{d[5:]}</text>'
+        )
+
+    legend = ""
+    if show_legend:
+        legend = "".join(
+            f'<rect x="{margin["left"] + i * 150}" y="{height - 14}" width="10" height="10" '
+            f'fill="{_CATEGORY_COLORS[c]}"/>'
+            f'<text x="{margin["left"] + i * 150 + 14}" y="{height - 5}" font-size="9" fill="#444">'
+            f'{c.replace("UNRECONCILED_", "UNR_")}</text>'
+            for i, c in enumerate(categories)
+        )
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+        + "".join(elements)
+        + legend
+        + "</svg>"
+    )
+
+
 def _daily_chart(daily: list[dict]) -> str:
-    """Stacked SVG bar chart of BRL volume by category, one bar per day."""
+    """Two stacked line charts: Matched volume on top, non-matched categories below."""
     by_date: dict[str, dict[str, float]] = {}
     for r in daily:
         by_date.setdefault(r["reference_date"], {})[r["category"]] = r["amount_brl"]
@@ -211,48 +289,15 @@ def _daily_chart(daily: list[dict]) -> str:
     if not dates:
         return "<p style='color:#999;font-size:12px'>No daily data available.</p>"
 
-    margin = {"top": 20, "right": 16, "bottom": 60, "left": 60}
-    chart_h = 220
-    slot = 26
-    chart_w = len(dates) * slot
-    width = margin["left"] + chart_w + margin["right"]
-    height = margin["top"] + chart_h + margin["bottom"]
-
-    max_total = max(sum(v.values()) for v in by_date.values()) or 1.0
-
-    elements: list[str] = []
-    for i, d in enumerate(dates):
-        x = margin["left"] + i * slot + 3
-        bw = slot - 6
-        y_cursor = margin["top"] + chart_h
-        for cat in _RISK_CATEGORIES:
-            amt = by_date[d].get(cat, 0.0)
-            if amt <= 0:
-                continue
-            bh = amt / max_total * chart_h
-            y_cursor -= bh
-            fill = _CATEGORY_COLORS.get(cat, "#9e9e9e")
-            elements.append(f'<rect x="{x}" y="{y_cursor:.1f}" width="{bw}" height="{bh:.1f}" fill="{fill}"/>')
-        label_x = x + bw / 2
-        label_y = margin["top"] + chart_h + 14
-        elements.append(
-            f'<text x="{label_x:.1f}" y="{label_y}" text-anchor="end" font-size="9" fill="#555" '
-            f'transform="rotate(-60 {label_x:.1f} {label_y})">{d[5:]}</text>'
-        )
-
-    legend = "".join(
-        f'<rect x="{margin["left"] + i * 150}" y="{height - 14}" width="10" height="10" '
-        f'fill="{_CATEGORY_COLORS[c]}"/>'
-        f'<text x="{margin["left"] + i * 150 + 14}" y="{height - 5}" font-size="9" fill="#444">'
-        f'{c.replace("UNRECONCILED_", "UNR_")}</text>'
-        for i, c in enumerate(_RISK_CATEGORIES)
-    )
+    matched_svg = _line_chart_svg(by_date, dates, _MATCHED_CATEGORIES)
+    non_matched_svg = _line_chart_svg(by_date, dates, _NON_MATCHED_CATEGORIES)
 
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
-        + "".join(elements)
-        + legend
-        + "</svg>"
+        '<div style="font-size:11px;font-weight:bold;color:#444;margin-bottom:2px">Matched</div>'
+        f'{matched_svg}'
+        '<div style="font-size:11px;font-weight:bold;color:#444;margin:10px 0 2px">Non-Matched '
+        '(Mismatched, Unreconciled Processor, Unreconciled Internal)</div>'
+        f'{non_matched_svg}'
     )
 
 

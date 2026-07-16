@@ -1,7 +1,7 @@
 .PHONY: help up down build shell logs test test-generate-sample-data generate generate-large clean \
         load-cdc-transactions load-settlement load-reconciliation-runs load-reconciliation-results \
         load-enterprise-company seed-silver seed-company build-silver build-gold \
-        run-alerts run-cfo-report
+        run-alerts run-cfo-report run-ops-run-report run_pipeline
 .DEFAULT_GOAL := help
 
 COMPOSE := docker compose
@@ -73,12 +73,23 @@ build-silver: seed-silver seed-company ## Silver: build curated views (winning-r
 
 build-gold: build-silver ## Gold: build gold layer views and tables
 	$(PIPELINE) python -m src.c_gold.build
+	$(PIPELINE) python scripts/print_health.py gold_ops_reconciliation_daily --pk reference_date,category
+	$(PIPELINE) python scripts/print_health.py gold_ops_reconciliation_trend --pk reference_date,category
+	$(PIPELINE) python scripts/print_health.py gold_cfo_weekly_summary --pk week_start,category
+	$(PIPELINE) python scripts/print_health.py gold_cfo_weekly_merchant_ranking --pk week_start,merchant_id,category
+	$(PIPELINE) python scripts/print_health.py gold_compliance_ledger --pk result_id
+	$(PIPELINE) python scripts/print_health.py gold_ops_run_history --pk run_id,category
 
 run-alerts: ## Run ops alert for the latest reconciled date
 	$(PIPELINE) python -m src.products.ops_alert "" outputs
 
 run-cfo-report: ## Render CFO report for the entire available period
 	$(PIPELINE) python -m src.products.cfo_report
+
+run-ops-run-report: ## Render ops run-history report (last 8 days, all run attempts)
+	$(PIPELINE) python -m src.products.ops_run_report "" outputs
+
+run_pipeline: generate build-gold run-alerts run-cfo-report run-ops-run-report ## Run the full pipeline end-to-end: generate sample data, build gold, render all products
 
 clean: ## Remove generated artifacts and stop the container
 	-$(PIPELINE) rm -rf docs/sample-data/*

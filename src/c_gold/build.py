@@ -22,6 +22,7 @@ _SQL_DIR = Path(__file__).parent / "sql"
 _ARTIFACTS = [
     "ops_reconciliation_daily.sql",
     "ops_reconciliation_trend.sql",
+    "ops_run_history.sql",
     "cfo_weekly_summary.sql",
     "cfo_weekly_merchant_ranking.sql",
     "compliance_ledger.sql",
