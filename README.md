@@ -235,150 +235,31 @@ Fique à vontade para usar ferramentas de IA durante o desafio. Se usar, documen
 
 ### Como rodar
 
-**Pré-requisito:** Docker e Docker Compose instalados.
-
-```bash
-# 1. Subir o container
-docker compose up -d --build
-
-# 2. Seed da silver layer — carrega os dados históricos de exemplo
-make seed-silver      # reconciliation_runs + reconciliation_results
-make seed-company     # enterprise_company (dados cadastrais dos merchants)
-
-# 3. (Opcional) Rodar uma reconciliação adicional para uma data específica
-#    Primeiro, carregar o CSV do PaySettler no bronze:
-docker compose exec pipeline python -m src.bronze.settlement_loader \
-    docs/sample-data/settlement_paysettler.csv 2025-03-15
-#    Depois, rodar a reconciliação:
-docker compose exec pipeline python -m src.silver.reconcile 2025-03-15
-
-# 4. Construir a gold layer (views e tabelas analíticas)
-make build-gold
-
-# 5. Gerar artefatos de saída
-make run-alerts        # outputs/{date}_alert.json + _chart.svg
-make run-cfo-report    # outputs/{start}_{end}_cfo_report.html
-
-# 6. (Opcional) Rodar os testes
-make test
-
-# 7. (Opcional) Gerar dados sintéticos em escala
-make generate          # 10k linhas em docs/sample-data
-make generate-large    # 1M linhas em docs/sample-data
-```
-
-O banco DuckDB persiste em `data/warehouse.duckdb`. Para inspecionar diretamente:
-
-```bash
-docker compose exec pipeline python -c "
-import duckdb; conn = duckdb.connect('data/warehouse.duckdb')
-print(conn.execute('SHOW TABLES').fetchdf())
-"
-```
-
----
+_Descreva os passos para rodar a aplicação._
 
 ### Premissas e decisões
 
-**Ambiguidades encontradas e como foram resolvidas:**
-
-1. **Um CSV por `reference_date` ou múltiplos?** O enunciado descreve um arquivo diário. Assumi um arquivo por data de referência. O schema de `raw_paysettler_settlements` usa `(transaction_id, reference_date)` como PK — recarregar o mesmo arquivo é idempotente (INSERT OR REPLACE), mas dois arquivos para a mesma data seriam mergeados (comportamento documentado, não bloqueado).
-
-2. **Status `REVERSED` no CSV do PaySettler.** O enunciado menciona `SETTLED` e `REVERSED`. A reconciliação filtra apenas `SETTLED` (linhas `REVERSED` são carregadas no bronze mas excluídas do join). Justificativa: uma transação revertida não está "liquidada" para fins de reconciliação — compará-la com o registro interno geraria UNRECONCILED_PROCESSOR artificiais.
-
-3. **Tolerância de R$ 0,01 implementada como `ABS(diff) <= 0.01`.** Exatamente conforme o glossário. Valores como `0.005` (possível com arredondamento de IOF) são classificados como MATCHED.
-
-4. **Silver append-only.** Reprocessar uma data cria um novo run — nunca sobrescreve. Downstream usa o "winning-run" (latest COMPLETED per `reference_date`) para estado atual. Compliance usa todos os runs. Essa decisão torna reruns seguros sem locks ou transações distribuídas.
-
-5. **Gold CFO como TABLE, não VIEW.** O CFO precisa de um snapshot semanal que não mude retroativamente. Uma VIEW sobre a silver sempre refletiria reruns passados — o CFO veria números diferentes ao reabrir o relatório da semana anterior. A TABLE congela o estado no momento do build.
-
-6. **Transações com `status != 'COMPLETED'` excluídas da janela interna.** Apenas transações `COMPLETED` do sistema interno são incluídas na reconciliação. `PENDING` e `FAILED` não devem aparecer como UNRECONCILED_INTERNAL — elas simplesmente não participam do escopo.
-
----
+_Documente as ambiguidades que encontrou e as decisões que tomou._
 
 ### Visão geral da arquitetura
 
-Arquitetura medalhão de 3 camadas rodando inteiramente em DuckDB local:
-
-```
-Fontes (Parquet + CSV)
-        │
-        ▼
-   Bronze Layer          raw_transactions, raw_paysettler_settlements
-        │                Deduplicação, normalização de amount, CDC
-        ▼
-   Silver Layer          silver_reconciliation_runs/results/enterprise_company
-        │                Append-only, quality gates, audit trail
-        ▼
-   Gold Layer            5 artefatos analíticos por consumidor
-        │                (2 VIEWs Ops, 2 TABLEs CFO, 1 VIEW Compliance)
-        ▼
-   Outputs               Slack alert JSON + SVG, HTML email CFO
-```
-
-Veja o desenho completo e as decisões de produção em [`docs/arquitetura.md`](docs/arquitetura.md).
-
-Documentação dos produtos de dados por consumidor (quais perguntas cada artefato responde): [`docs/produtos-de-dados.md`](docs/produtos-de-dados.md).
-
-Exemplos de queries rodando contra as tabelas gold: [`docs/exemplo-queries.md`](docs/exemplo-queries.md).
-
-Schema técnico da gold layer e decisões de design: [`docs/gold-schema.md`](docs/gold-schema.md).
-
----
+_Descreva a estrutura do projeto. Diagrama é bem-vindo._
 
 ### Extensibilidade
 
-**Cenário:** adicionar um segundo processador de liquidação (ex.: `PayBoss`) com schema parecido mas não idêntico ao PaySettler.
-
-**Arquivos que mudam:**
-
-| Arquivo | Mudança |
-|---------|---------|
-| `src/bronze/payboss_loader.py` | **NOVO** — ~100 linhas. Copia a estrutura de `settlement_loader.py`, adapta os nomes de colunas do PayBoss e cria `raw_payboss_settlements`. A normalização de amount já é uma função reutilizável. |
-| `src/silver/reconcile.py` | **~10 linhas alteradas** — a CTE `processor` do SQL de reconciliação precisa de um parâmetro `source` que seleciona entre `raw_paysettler_settlements` e `raw_payboss_settlements`. Alternativamente, criar uma view `raw_settlements_unified` que faz UNION das duas fontes — nesse caso `reconcile.py` não muda nada. |
-| `Makefile` | **2-3 linhas** — target `seed-payboss` para carregar os dados de exemplo. |
-| `tests/` | **1 novo notebook** — `test_payboss_loader.ipynb` seguindo o padrão dos existentes. |
-
-**Total:** 1 arquivo novo (~100 linhas), 1 arquivo com ~10 linhas alteradas (ou zero, se usar a abordagem de view unificada), 2-3 linhas no Makefile.
-
-A gold layer, os SQLs analíticos e os outputs **não mudam** — eles consomem silver, que já é agnóstica à fonte.
-
----
+_Se amanhã precisarmos plugar uma **segunda fonte de liquidação** (ex.: outro processador além do PaySettler, com schema parecido mas não idêntico), **quantos arquivos/linhas mudam** no seu projeto? Descreva o caminho concreto — quais módulos tocam, qual config precisa ser estendida, quais testes rodam de novo._
 
 ### Limites do desenho
 
-1. **Rebuild total do gold a cada execução.** `CREATE OR REPLACE TABLE` nas tabelas CFO re-escaneia toda a silver history. Com ~1,8B linhas em 18 meses, isso passa de segundos para minutos/horas. Não há mecanismo de "fechar semana" que impeça o rebuild de sobrescrever snapshots históricos — a propriedade de snapshot imutável do CFO é uma convenção, não uma garantia do código.
-
-2. **Nenhum mecanismo de triggering baseado em eventos.** O pipeline é inteiramente CLI-pull: alguém (ou um cron) tem que chamar `settlement_loader`, `reconcile`, `build-gold` na ordem certa. Não há reação a "arquivo CSV chegou no S3" ou "Kafka topic tem mensagem nova". Uma falha no agendamento externo simplesmente para a cadeia sem alarme próprio.
-
-3. **DuckDB single-process bloqueia concorrência.** Só um processo pode escrever no `warehouse.duckdb` por vez. Rodar `build-gold` enquanto `reconcile` está em progresso resulta em erro de lock. Em produção com múltiplos pipelines paralelos (diferentes `reference_date`s), isso é um gargalo imediato.
-
----
+_O que a sua arquitetura **deliberadamente não suporta hoje** e que você sabe que uma versão de produção precisaria? Dê **2 a 3 exemplos concretos** (evite "melhorar logs" ou "mais testes" — seja específico)._
 
 ### O que faria diferente em produção
 
-**O que foi simplificado:**
-
-- **DuckDB local em vez de warehouse distribuído.** Para os ~5M txns/mês do enunciado, DuckDB é suficiente. Para a projeção de 5M/dia (Parte 3.3), seria necessário Spark ou BigQuery com Parquet particionado no S3.
-
-- **Outputs como arquivos estáticos em vez de integrações reais.** O alerta de Ops gera um JSON no formato Slack Block Kit, mas não chama a API do Slack. O relatório do CFO gera HTML, mas não envia email. Em produção: webhook Slack + SMTP/SendGrid com template aprovado pelo time.
-
-- **Orquestração via Makefile + cron externo.** Em produção usaria Airflow ou Dagster para: retry automático, dependência explícita entre tarefas (bronze → silver → gold → outputs), alertas de SLA, e backfill de datas.
-
-- **Sem particionamento no storage.** Bronze e silver vivem num único arquivo DuckDB. Em produção: Parquet particionado por `reference_date` no S3, com o warehouse lendo partições incrementalmente.
-
----
+_O que simplificou? O que a versão de produção precisaria?_
 
 ### Ferramentas de IA utilizadas
 
-**Claude Code (claude-sonnet-4-6)** via CLI para:
-
-- **Design de arquitetura:** discussão das trade-offs entre medallion layers, winning-run policy, por que VIEWs vs TABLEs para cada consumidor.
-- **Geração de código:** esqueleto inicial dos loaders bronze, lógica de reconciliação em `reconcile.py`, SQL das views/tables gold, outputs (alerta Ops + relatório CFO HTML).
-- **Documentação:** estrutura e conteúdo de `docs/gold-schema.md`, `docs/produtos-de-dados.md`, `docs/arquitetura.md`, `docs/exemplo-queries.md`, e as seções desta entrega.
-- **Code review:** verificação de idempotência, gaps de qualidade de dados, e consistência entre o glossário de domínio e a implementação.
-
-O processo foi iterativo: Claude propunha, eu validava contra o enunciado e o glossário, redirecionava onde necessário. As decisões de design (winning-run policy, append-only silver, CFO frozen snapshot) foram deliberadas e discutidas — não defaults do modelo.
+_Quais ferramentas de IA usou e para quê? Encorajamos o uso de IA — queremos entender como você a utiliza como ferramenta de trabalho._
 
 ---
 
